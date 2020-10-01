@@ -187,6 +187,15 @@ class ProjectRepository extends EntityRepository
      */
     public function getQueryBuilderForFormType(ProjectFormTypeQuery $query): QueryBuilder
     {
+        $qbassociazione = $this->getEntityManager()->createQueryBuilder();
+        $associazioni = $qbassociazione
+          ->select('a')
+          ->from(Associazioneobiettivi::class, 'a')
+          ->where($qbassociazione->expr()->eq('a.user', ':user'))
+          ->setParameter('user', $query->getUser())
+          ->getQuery()
+          ->getResult();
+
         $qb = $this->getEntityManager()->createQueryBuilder();
 
         $qb
@@ -199,7 +208,10 @@ class ProjectRepository extends EntityRepository
 
         $qb->andWhere($qb->expr()->eq('p.visible', ':visible'));
         $qb->andWhere($qb->expr()->eq('c.visible', ':customer_visible'));
-
+        foreach (\is_array($associazioni) ? $associazioni : [] as $associazione) {
+            $qb->andWhere($qb->expr()->in('p.id', ':project'))
+              ->setParameter('project', $associazione->getProject());
+        }
         if (!$query->isIgnoreDate()) {
             $now = new \DateTime();
             $qb->andWhere(
