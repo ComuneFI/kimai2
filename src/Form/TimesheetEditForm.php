@@ -129,7 +129,7 @@ class TimesheetEditForm extends AbstractType
         $builder->add('metaFields', MetaFieldsCollectionType::class);
 
         $this->addExported($builder, $options);
-        $this->addBillable($builder, $options);
+        //$this->addBillable($builder, $options);
     }
 
     protected function showCustomer(array $options, bool $isNew, int $customerCount): bool
