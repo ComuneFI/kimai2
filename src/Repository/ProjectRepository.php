@@ -12,7 +12,6 @@ namespace App\Repository;
 use App\Entity\Activity;
 use App\Entity\Project;
 use App\Entity\ProjectComment;
-use App\Entity\Team;
 use App\Entity\Timesheet;
 use App\Entity\User;
 use App\Model\ProjectStatistic;
@@ -21,17 +20,13 @@ use App\Repository\Paginator\LoaderPaginator;
 use App\Repository\Paginator\PaginatorInterface;
 use App\Repository\Query\ProjectFormTypeQuery;
 use App\Repository\Query\ProjectQuery;
-use DateTime;
-use Doctrine\DBAL\Types\Types;
 use Doctrine\ORM\EntityRepository;
 use Doctrine\ORM\ORMException;
 use Doctrine\ORM\Query;
 use Doctrine\ORM\QueryBuilder;
+use KimaiPlugin\PresenzaBundle\Entity\Associazioneobiettivi;
 use Pagerfanta\Pagerfanta;
 
-/**
- * @extends \Doctrine\ORM\EntityRepository<Project>
- */
 class ProjectRepository extends EntityRepository
 {
     /**
@@ -79,80 +74,57 @@ class ProjectRepository extends EntityRepository
         return $this->count([]);
     }
 
-    public function getProjectStatistics(Project $project, ?DateTime $begin = null, ?DateTime $end = null): ProjectStatistic
+    public function getProjectStatistics(Project $project, ?\DateTime $begin = null, ?\DateTime $end = null): ProjectStatistic
     {
+        $stats = new ProjectStatistic($project);
+
         $qb = $this->getEntityManager()->createQueryBuilder();
+
         $qb
             ->from(Timesheet::class, 't')
-            ->addSelect('COUNT(t.id) as amount')
-            ->addSelect('COALESCE(SUM(t.duration), 0) as duration')
-            ->addSelect('COALESCE(SUM(t.rate), 0) as rate')
-            ->addSelect('COALESCE(SUM(t.internalRate), 0) as internal_rate')
+            ->addSelect('COUNT(t.id) as recordAmount')
+            ->addSelect('SUM(t.duration) as recordDuration')
+            ->addSelect('SUM(t.rate) as recordRate')
+            ->addSelect('SUM(t.internalRate) as recordInternalRate')
             ->andWhere('t.project = :project')
             ->setParameter('project', $project)
         ;
 
-        // to calculate a budget at a certain point in time
+        if (null !== $begin) {
+            $qb->andWhere($qb->expr()->gte('t.begin', ':begin'))
+                ->setParameter('begin', $begin);
+        }
         if (null !== $end) {
             $qb->andWhere($qb->expr()->lte('t.end', ':end'))
                 ->setParameter('end', $end);
         }
 
-        $timesheetResult = $qb->getQuery()->getOneOrNullResult();
+        $timesheetResult = $qb->getQuery()->getArrayResult();
 
-        $stats = new ProjectStatistic();
-
-        if (null !== $timesheetResult) {
-            $stats->setRecordAmount($timesheetResult['amount']);
-            $stats->setRecordDuration($timesheetResult['duration']);
-            $stats->setRecordRate($timesheetResult['rate']);
-            $stats->setRecordInternalRate($timesheetResult['internal_rate']);
+        if (isset($timesheetResult[0])) {
+            $stats->setRecordAmount($timesheetResult[0]['recordAmount']);
+            $stats->setRecordDuration($timesheetResult[0]['recordDuration']);
+            $stats->setRecordRate($timesheetResult[0]['recordRate']);
+            $stats->setRecordInternalRate($timesheetResult[0]['recordInternalRate']);
         }
 
         $qb = $this->getEntityManager()->createQueryBuilder();
-        $qb
-            ->from(Timesheet::class, 't')
-            ->addSelect('COUNT(t.id) as amount')
-            ->addSelect('COALESCE(SUM(t.duration), 0) as duration')
-            ->addSelect('COALESCE(SUM(t.rate), 0) as rate')
-            ->andWhere('t.project = :project')
-            ->andWhere('t.billable = :billable')
-            ->setParameter('project', $project)
-            ->setParameter('billable', true, Types::BOOLEAN)
-        ;
-
-        // to calculate a budget at a certain point in time
-        if (null !== $end) {
-            $qb->andWhere($qb->expr()->lte('t.end', ':end'))
-                ->setParameter('end', $end);
-        }
-
-        $timesheetResult = $qb->getQuery()->getOneOrNullResult();
-
-        if (null !== $timesheetResult) {
-            $stats->setDurationBillable($timesheetResult['duration']);
-            $stats->setRateBillable($timesheetResult['rate']);
-            $stats->setRecordAmountBillable($timesheetResult['amount']);
-        }
-
-        $qb = $this->getEntityManager()->createQueryBuilder();
-        $qb
+        $qb->select('COUNT(a.id) as activityAmount')
             ->from(Activity::class, 'a')
-            ->select('COUNT(a.id) as amount')
             ->andWhere('a.project = :project')
-            ->setParameter('project', $project)
         ;
+        $resultActivities = $qb->getQuery()->execute(['project' => $project], Query::HYDRATE_ARRAY);
 
-        $resultActivities = $qb->getQuery()->getOneOrNullResult();
+        if (isset($resultActivities[0])) {
+            $resultActivities = $resultActivities[0];
 
-        if (null !== $resultActivities) {
-            $stats->setActivityAmount($resultActivities['amount']);
+            $stats->setActivityAmount($resultActivities['activityAmount']);
         }
 
         return $stats;
     }
 
-    public function addPermissionCriteria(QueryBuilder $qb, ?User $user = null, array $teams = [])
+    private function addPermissionCriteria(QueryBuilder $qb, ?User $user = null, array $teams = [])
     {
         // make sure that all queries without a user see all projects
         if (null === $user && empty($teams)) {
@@ -160,7 +132,7 @@ class ProjectRepository extends EntityRepository
         }
 
         // make sure that admins see all projects
-        if (null !== $user && $user->canSeeAllData()) {
+        if (null !== $user && ($user->isSuperAdmin() || $user->isAdmin())) {
             return;
         }
 
@@ -168,30 +140,29 @@ class ProjectRepository extends EntityRepository
             $teams = array_merge($teams, $user->getTeams()->toArray());
         }
 
+        $qb->leftJoin('p.teams', 'teams')
+            ->leftJoin('c.teams', 'c_teams');
+
         if (empty($teams)) {
-            $qb->andWhere('SIZE(c.teams) = 0');
-            $qb->andWhere('SIZE(p.teams) = 0');
+            $qb->andWhere($qb->expr()->isNull('c_teams'));
+            $qb->andWhere($qb->expr()->isNull('teams'));
 
             return;
         }
 
         $orProject = $qb->expr()->orX(
-            'SIZE(p.teams) = 0',
+            $qb->expr()->isNull('teams'),
             $qb->expr()->isMemberOf(':teams', 'p.teams')
         );
         $qb->andWhere($orProject);
 
         $orCustomer = $qb->expr()->orX(
-            'SIZE(c.teams) = 0',
+            $qb->expr()->isNull('c_teams'),
             $qb->expr()->isMemberOf(':teams', 'c.teams')
         );
         $qb->andWhere($orCustomer);
 
-        $ids = array_values(array_unique(array_map(function (Team $team) {
-            return $team->getId();
-        }, $teams)));
-
-        $qb->setParameter('teams', $ids);
+        $qb->setParameter('teams', $teams);
     }
 
     /**
@@ -215,7 +186,14 @@ class ProjectRepository extends EntityRepository
     public function getQueryBuilderForFormType(ProjectFormTypeQuery $query): QueryBuilder
     {
         $qb = $this->getEntityManager()->createQueryBuilder();
-
+        $qbassociazione = $this->getEntityManager()->createQueryBuilder();
+        $associazioni = $qbassociazione
+          ->select('a')
+          ->from(Associazioneobiettivi::class, 'a')
+          ->where($qbassociazione->expr()->eq('a.user', ':user'))
+          ->setParameter('user', $query->getUser())
+          ->getQuery()
+          ->getResult();
         $qb
             ->select('p')
             ->from(Project::class, 'p')
@@ -226,9 +204,16 @@ class ProjectRepository extends EntityRepository
 
         $qb->andWhere($qb->expr()->eq('p.visible', ':visible'));
         $qb->andWhere($qb->expr()->eq('c.visible', ':customer_visible'));
-
+        $progetti = [];
+        foreach (\is_array($associazioni) ? $associazioni : [] as $associazione) {
+            $progetti[] = $associazione->getProject();
+        }
+        if (\is_array($progetti)) {
+            $qb->andWhere($qb->expr()->in('p.id', ':project'))
+              ->setParameter('project', $progetti);
+        }
         if (!$query->isIgnoreDate()) {
-            $now = new DateTime();
+            $now = new \DateTime();
             $qb->andWhere(
                 $qb->expr()->andX(
                     $qb->expr()->orX(
@@ -289,33 +274,27 @@ class ProjectRepository extends EntityRepository
             ->leftJoin('p.customer', 'c')
         ;
 
-        foreach ($query->getOrderGroups() as $orderBy => $order) {
-            switch ($orderBy) {
-                case 'customer':
-                    $orderBy = 'c.name';
-                    break;
-                case 'project_start':
-                    $orderBy = 'p.start';
-                    break;
-                case 'project_end':
-                    $orderBy = 'p.end';
-                    break;
-                default:
-                    $orderBy = 'p.' . $orderBy;
-                    break;
-            }
-            $qb->addOrderBy($orderBy, $order);
+        $orderBy = $query->getOrderBy();
+        switch ($orderBy) {
+            case 'customer':
+                $orderBy = 'c.name';
+                break;
+            default:
+                $orderBy = 'p.' . $orderBy;
+                break;
         }
 
-        if (!$query->isShowBoth()) {
+        $qb->addOrderBy($orderBy, $query->getOrder());
+
+        if (\in_array($query->getVisibility(), [ProjectQuery::SHOW_VISIBLE, ProjectQuery::SHOW_HIDDEN])) {
             $qb
                 ->andWhere($qb->expr()->eq('p.visible', ':visible'))
                 ->andWhere($qb->expr()->eq('c.visible', ':customer_visible'))
             ;
 
-            if ($query->isShowVisible()) {
+            if (ProjectQuery::SHOW_VISIBLE === $query->getVisibility()) {
                 $qb->setParameter('visible', true, \PDO::PARAM_BOOL);
-            } elseif ($query->isShowHidden()) {
+            } elseif (ProjectQuery::SHOW_HIDDEN === $query->getVisibility()) {
                 $qb->setParameter('visible', false, \PDO::PARAM_BOOL);
             }
 
@@ -401,6 +380,11 @@ class ProjectRepository extends EntityRepository
                 $qb->andWhere($searchAnd);
             }
         }
+
+        // this will make sure, that we do not accidentally create results with multiple rows
+        //   => which would result in a wrong LIMIT / pagination results
+        // the second group by is needed due to SQL standard (even though logically not really required for this query)
+        $qb->addGroupBy('p.id')->addGroupBy($orderBy);
 
         return $qb;
     }
